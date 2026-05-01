@@ -287,3 +287,70 @@ Skills encode migration best practices that override default agent behavior in s
 
 - **Microsoft.GitHubCopilot.AppModernization.MCP** — Project analysis, SDK-style conversion, build tooling.
 - **Swick.Mcp.Fx2dotnet** — Discovers minimum NuGet package versions needed for a target framework, resolves feeds, and reports legacy packaging patterns.
+
+## Code Structure
+
+```
+fx2dotnet/
+├── plugins/
+│   └── fx2dotnet-modernization/    # Copilot agent plugin
+│       ├── plugin.json             # Plugin manifest (name, version, agent/skill paths)
+│       ├── .mcp.json               # MCP server registrations consumed by the plugin
+│       ├── agents/                 # Agent definition files (.agent.md)
+│       └── skills/                 # Skill definition files (SKILL.md per subdirectory)
+└── src/
+    └── fx2dotnet/                  # Swick.Mcp.Fx2dotnet — the only buildable project
+        ├── fx2dotnet.csproj
+        ├── Program.cs              # MCP stdio host entry point
+        ├── Tools.cs                # MCP tool definitions (exposed to agents)
+        ├── Models/
+        │   ├── PackageModels.cs    # Records for package input/output shapes
+        │   └── DependencyModels.cs # Records for dependency-layer input/output shapes
+        └── Services/
+            ├── NuGetPackageSupportService.cs  # NuGet feed queries and package analysis
+            └── DependencyLayerComputer.cs     # Topological layer grouping algorithm
+```
+
+### Agents (`plugins/fx2dotnet-modernization/agents/`)
+
+Each `.agent.md` file declares a YAML frontmatter block (`name`, `description`, `tools`, `agents`, `handoffs`) followed by the agent's prompt.
+
+| File | Agent name | Role |
+|------|-----------|------|
+| `dotnet-fx-to-modern-dotnet.agent.md` | **.NET Framework to Modern .NET** | **Orchestrator.** Enforces the 7-phase flow end-to-end: initialises state, invokes phase agents in order, persists progress to `.fx2dotnet/plan.md`. |
+| `assessment.agent.md` | **Assessment of .NET Solution for Migration** | Classifies every project, audits NuGet compatibility, writes `analysis.md` and `package-updates.md`. Read-only — no code changes. |
+| `migration-planner.agent.md` | **Migration Planner** | Synthesises assessment data into a phased execution plan (SDK candidates, package chunks, web host candidates). Read-only. |
+| `sdk-project-conversion.agent.md` | **SDK-Style Project Conversion** | Converts legacy `.csproj` files to SDK-style format, one project at a time in dependency order. Calls **Build Fix** after each conversion. |
+| `package-compat-core.agent.md` | **Package Compatibility Core Migration** | Applies the planner's chunked NuGet update schedule (no-change → minor → major), with **Build Fix** after each chunk. |
+| `multitarget.agent.md` | **Multitarget Migration** | Adds the modern TFM (`net10.0`) alongside the existing one; fixes API incompatibilities pre- and post-switch. Processes projects layer by layer. |
+| `aspnet-framework-to-aspnetcore-web-migration.agent.md` | **ASP.NET Framework to ASP.NET Core Web Migration** | Creates a new ASP.NET Core host side-by-side, ports routes incrementally, and validates endpoint parity. |
+| `build-fix.agent.md` | **Build Fix** | Iterative build → diagnose → fix loop. Called throughout every phase to catch regressions. |
+| `project-type-detector.agent.md` | **Project Type Detector** | Classifies a single project (web host, Windows Service, library, etc.). Used by Assessment. |
+| `legacy-web-route-inventory.agent.md` | **Legacy Web Route Inventory** | Discovers ASP.NET Framework routes and endpoints. Used by Web Migration. |
+
+### Skills (`plugins/fx2dotnet-modernization/skills/`)
+
+Each subdirectory contains a `SKILL.md` that encodes a migration policy. The `description` frontmatter field determines when the skill is applied (keyword matching).
+
+| Directory | Policy summary |
+|-----------|---------------|
+| `ef6-migration-policy/` | Retain EF6 throughout the migration; never swap to EF Core until the app is fully on modern .NET. |
+| `systemweb-adapters/` | Use `Microsoft.AspNetCore.SystemWebAdapters` as the default approach for `System.Web` types; native ASP.NET Core rewrites are a post-migration optimisation. |
+| `windows-service-migration/` | Replace `ServiceBase` with `BackgroundService` + Generic Host (`Microsoft.Extensions.Hosting.WindowsServices`). |
+| `launching-iisexpress/` | Guidance for launching IIS Express during incremental side-by-side web migration. |
+| `owin-identity/` | Policy for OWIN Identity middleware during ASP.NET Framework → ASP.NET Core migration. |
+
+### `src/fx2dotnet` — NuGet MCP Server
+
+The only buildable project in this repo. It is an MCP server (`PackageType=McpServer`) that exposes three tools to agents over stdio JSON-RPC:
+
+| Tool | Description |
+|------|-------------|
+| `FindRecommendedPackageUpgrades` | Takes a list of `{packageId, currentVersion}` pairs and returns only those that need upgrading to reach the minimum version supporting .NET Core / .NET Standard. Also flags packages with legacy `content/` folders or `install.ps1` scripts. |
+| `GetMinimalPackageSet` | Given a set of direct `PackageReference` entries, returns the minimal subset that must stay direct (i.e. prunes transitively-provided packages). Used during SDK-style project conversion to clean up redundant references. |
+| `ComputeDependencyLayers` | Performs iterative graph reduction on a project dependency graph and returns projects grouped into dependency layers (Layer 1 = leaves with no in-scope deps, Layer N = projects whose dependencies are all in earlier layers). Detects and reports cyclic projects. |
+
+**Key services:**
+
+- `NuGetPackageSupportService` — queries NuGet feeds (via `NuGet.Protocol`) to find the minimum package version that lists a `.NETCoreApp` or `.NETStandard` target framework moniker in its `lib/` folders. Also checks for legacy packaging patterns (`content/` folder, `install.ps1`).
+- `DependencyLayerComputer` — pure graph algorithm (no I/O). Normalises project paths, builds an adjacency map, and iteratively strips zero-dependency nodes into numbered layers until the graph is empty or only cycles remain.
